@@ -1,0 +1,69 @@
+# Checks once a day that nimjar.vercel.app is up and can still read both
+# Nimiq networks. A failed run emails the repo owner.
+name: Uptime
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the live site
+        env:
+          SITE: https://nimjar.vercel.app
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys, time, urllib.request
+
+          site = os.environ["SITE"]
+          failures = []
+
+          def get(path, tries=3):
+              for attempt in range(tries):
+                  try:
+                      req = urllib.request.Request(site + path, headers={"user-agent": "nimjar-uptime"})
+                      with urllib.request.urlopen(req, timeout=30) as res:
+                          return res.status, res.read()
+                  except Exception as err:
+                      last = err
+                      time.sleep(10)
+              return None, str(last).encode()
+
+          def check(path, test):
+              status, body = get(path)
+              try:
+                  ok = status == 200 and test(body)
+              except Exception:
+                  ok = False
+              print(("ok   " if ok else "FAIL ") + path + f"  ({status})")
+              if not ok:
+                  failures.append(f"{path} -> {status}: {body[:200]!r}")
+
+          js = lambda b: json.loads(b)
+
+          # The page and the files it loads
+          check("/", lambda b: b"NimJar" in b)
+          for f in ("/app.js", "/app.css", "/sdk.js", "/icon.svg"):
+              check(f, lambda b: len(b) > 100)
+
+          # Both networks reachable
+          check("/api/networks", lambda b: js(b)["main"]["height"] > 0 and js(b)["test"]["height"] > 0)
+
+          # Wallet reads and validator pick work on mainnet and testnet
+          for net in ("main", "test"):
+              check(f"/api/overview?net={net}",
+                    lambda b, net=net: js(b)["net"] == net and js(b)["height"] > 0 and js(b)["suggested"]["address"])
+              check(f"/api/history?net={net}", lambda b: isinstance(js(b)["history"], list))
+
+          if failures:
+              print("\nNimJar is not healthy:\n" + "\n".join(failures))
+              sys.exit(1)
+          print("\nNimJar is healthy.")
+          EOF
