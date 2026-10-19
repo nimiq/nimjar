@@ -91,7 +91,7 @@ const ADDRESS = {
  * route, not crash every route.
  */
 const PUBLIC = new URL("../public/", import.meta.url);
-const TYPES = { "/app.js": "text/javascript", "/app.css": "text/css", "/icon.svg": "image/svg+xml", "/sdk.js": "text/javascript" };
+const TYPES = { "/app.js": "text/javascript", "/app.css": "text/css", "/icon.svg": "image/svg+xml", "/sdk.js": "text/javascript", "/nimiq-pay-widget.json": "application/json" };
 const files = new Map();
 function publicFile(route) {
   if (!files.has(route)) {
@@ -210,17 +210,12 @@ function describe(address, healthy, dir) {
   return { address, stakers: chainInfo?.stakers ?? null, healthy: !!chainInfo, ...(info ?? {}) };
 }
 
-/** Everything one screen needs, in one request. */
-async function overview(address, net) {
+/**
+ * The staker's balances, which of the three steps out it is on, and when the
+ * wait is over. Shared by the app's overview and the Nimiq Pay widget.
+ */
+async function stakeState(staker, net, height) {
   const chain = net.chain;
-  const [pay, staker, healthy, dir, height] = await Promise.all([
-    chain.payBalance(address),
-    chain.staker(address),
-    healthyValidators(net),
-    validatorDirectory(net),
-    chain.height(),
-  ]);
-
   const staked = BigInt(staker?.balance ?? 0);
   const inactive = BigInt(staker?.inactiveBalance ?? 0);
   const retired = BigInt(staker?.retiredBalance ?? 0);
@@ -249,16 +244,43 @@ async function overview(address, net) {
 
   const secondsLeft = releaseAt && height < releaseAt ? releaseAt - height : 0;
 
-  // Rewards received so far, for pools that add them to the stake. See
-  // Chain.stakeFlows for why this is measured as "in the stake now, minus what
-  // you put in". Direct pools pay into the wallet instead: no number then.
-  let earned = null;
+  return {
+    staked,
+    inactive,
+    retired,
+    releaseAt,
+    secondsLeft,
+    isStaking: staked > 0n || leavingIn > 0n || leavingOut > 0n,
+    /** Which of the three steps out the money is on, if any. */
+    leaving: leavingOut > 0n ? "ready" : leavingIn > 0n ? (secondsLeft > 0 ? "waiting" : "releasable") : null,
+  };
+}
+
+/**
+ * Rewards received so far, for pools that add them to the stake. See
+ * Chain.stakeFlows for why this is measured as "in the stake now, minus what
+ * you put in". Direct pools pay into the wallet instead: no number then.
+ */
+async function earnedSoFar(address, net, { staked, inactive, retired }) {
   const inStake = staked + inactive + retired;
-  if (inStake > 0n) {
-    const flows = await chain.stakeFlows(address).catch(() => null);
-    const principal = flows ? flows.deposited - flows.withdrawn : null;
-    if (flows?.complete && principal !== null && inStake >= principal) earned = String(inStake - principal);
-  }
+  if (inStake === 0n) return null;
+  const flows = await net.chain.stakeFlows(address).catch(() => null);
+  const principal = flows ? flows.deposited - flows.withdrawn : null;
+  return flows?.complete && principal !== null && inStake >= principal ? String(inStake - principal) : null;
+}
+
+/** Everything one screen needs, in one request. */
+async function overview(address, net) {
+  const chain = net.chain;
+  const [pay, staker, healthy, dir, height] = await Promise.all([
+    chain.payBalance(address),
+    chain.staker(address),
+    healthyValidators(net),
+    validatorDirectory(net),
+    chain.height(),
+  ]);
+  const state = await stakeState(staker, net, height);
+  const earned = await earnedSoFar(address, net, state);
 
   return {
     address,
@@ -270,23 +292,109 @@ async function overview(address, net) {
     spendable: String(pay.total),
     inAddress: String(pay.plain),
     heldByPay: String(pay.held),
-    staked: String(staked),
-    inactive: String(inactive),
-    retired: String(retired),
-    releaseAt,
-    secondsLeft,
+    staked: String(state.staked),
+    inactive: String(state.inactive),
+    retired: String(state.retired),
+    releaseAt: state.releaseAt,
+    secondsLeft: state.secondsLeft,
     delegation: staker?.delegation ?? null,
-    isStaking: staked > 0n || leavingIn > 0n || leavingOut > 0n,
-    /** Which of the three steps out the money is on, if any. */
-    leaving: leavingOut > 0n ? "ready" : leavingIn > 0n ? (secondsLeft > 0 ? "waiting" : "releasable") : null,
+    isStaking: state.isStaking,
+    leaving: state.leaving,
     earned,
     suggested: pickValidator(address, healthy, dir),
     current: describe(staker?.delegation, healthy, dir),
   };
 }
 
-const json = (res, code, body) => {
-  res.writeHead(code, { ...SECURITY, "content-type": "application/json", "cache-control": "no-store" });
+/**
+ * "Earned so far" for the widget, kept for an hour per wallet.
+ *
+ * Nimiq Pay refreshes a widget every few minutes while its home screen is
+ * open, and working out the earnings pages through the wallet's whole history
+ * and every swap contract Nimiq Pay ever funded for it. The number only moves
+ * when a pool pays out, so an hour-old answer is fine.
+ */
+const EARNED_TTL = 60 * 60_000;
+const earnedCache = new Map();
+async function cachedEarned(address, net, state) {
+  const key = `${net.name}:${compact(address)}`;
+  const hit = earnedCache.get(key);
+  if (hit && Date.now() - hit.at < EARNED_TTL) return hit.value;
+  const value = await earnedSoFar(address, net, state);
+  // A long-running instance must not grow without bound; starting over costs one slow request each.
+  if (earnedCache.size > 5000) earnedCache.clear();
+  earnedCache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+/**
+ * The card Nimiq Pay draws on its home screen for this wallet. Nimiq Pay draws
+ * it itself from this data, so it has to fit its format: amounts in luna as
+ * strings, short labels, at most three rows, and never an address.
+ * Format: nimiq-pay-widget.json and https://github.com/nimiq/nimiq-pay-app
+ * (src/lib/mini-app-widgets.ts).
+ *
+ * Skips what the widget doesn't show: the wallet's spendable balance (Nimiq Pay
+ * shows its own) and the suggested pool.
+ */
+async function widget(address, net) {
+  const [staker, healthy, dir, height] = await Promise.all([
+    net.chain.staker(address),
+    healthyValidators(net),
+    validatorDirectory(net),
+    net.chain.height(),
+  ]);
+  const state = await stakeState(staker, net, height);
+  const stillStaked = state.staked > 0n ? [{ label: "Still staked", luna: String(state.staked) }] : [];
+  const base = { v: 1, title: "Staking", refresh: 300 };
+
+  if (state.leaving === "waiting") {
+    return {
+      ...base,
+      value: { label: "Unstaking", luna: String(state.inactive) },
+      rows: stillStaked,
+      // About one block a second, the same reading the app's countdown uses.
+      countdown: { label: "Ready to withdraw", until: Math.floor(Date.now() / 1000) + state.secondsLeft },
+    };
+  }
+  if (state.leaving === "releasable") {
+    return {
+      ...base,
+      value: { label: "Ready to withdraw", luna: String(state.inactive) },
+      rows: stillStaked,
+      tone: "attention",
+      message: "Open NimJar to confirm the withdrawal.",
+    };
+  }
+  if (state.leaving === "ready") {
+    return {
+      ...base,
+      value: { label: "Ready to withdraw", luna: String(state.retired) },
+      rows: stillStaked,
+      tone: "attention",
+      message: "One tap in NimJar sends it to your wallet.",
+    };
+  }
+  if (!state.isStaking) {
+    return { ...base, value: { label: "Staked", luna: "0" }, message: "Tap to start earning." };
+  }
+
+  const rows = [];
+  const earned = await cachedEarned(address, net, state);
+  if (earned !== null) rows.push({ label: "Earned so far", luna: earned });
+  // The pool by name, as everywhere else in NimJar. Without a name in Nimiq's
+  // list the row is left out rather than showing an address on the home screen.
+  const pool = describe(staker?.delegation, healthy, dir);
+  if (pool?.name) {
+    const fee = pool.fee != null && pool.fee >= 0 && pool.fee < 1 ? ` · ${Math.round(pool.fee * 100)}% fee` : "";
+    rows.push({ label: "Pool", text: pool.name.slice(0, 32 - fee.length) + fee });
+  }
+  // Earnings move once a pool pays out, so a quiet stake needs fewer checks.
+  return { ...base, value: { label: "Staked", luna: String(state.staked) }, rows, refresh: 900 };
+}
+
+const json = (res, code, body, headers = {}) => {
+  res.writeHead(code, { ...SECURITY, "content-type": "application/json", "cache-control": "no-store", ...headers });
   res.end(JSON.stringify(body, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
 };
 
@@ -303,7 +411,9 @@ export async function handler(req, res) {
     if (req.method === "GET" && TYPES[url.pathname]) {
       const body = publicFile(url.pathname);
       if (!body) return json(res, 404, { error: "not found" });
-      res.writeHead(200, { ...SECURITY, "content-type": `${TYPES[url.pathname]}; charset=utf-8`, "cache-control": "no-cache" });
+      // Nimiq Pay's browser build reads the widget manifest across origins in development.
+      const cors = url.pathname === "/nimiq-pay-widget.json" ? { "access-control-allow-origin": "*" } : {};
+      res.writeHead(200, { ...SECURITY, "content-type": `${TYPES[url.pathname]}; charset=utf-8`, "cache-control": "no-cache", ...cors });
       return res.end(body);
     }
 
@@ -330,6 +440,18 @@ export async function handler(req, res) {
       // balance debuggable without asking the user to read hex off a phone.
       console.log(`[overview] ${net.name} ${address} → spendable ${nim(BigInt(o.spendable))} NIM, staked ${nim(BigInt(o.staked))} NIM`);
       return json(res, 200, o);
+    }
+
+    // The Nimiq Pay home screen widget. Nimiq Pay sends the wallet's address
+    // and its network by name, so there is no height guessing here. Its native
+    // requests need no CORS header; its browser build in development does.
+    if (req.method === "GET" && url.pathname === "/api/widget") {
+      const address = url.searchParams.get("address")?.trim();
+      if (!address) return json(res, 400, { error: "address is required" });
+      const widgetNet = NETS[url.searchParams.get("network") === "testnet" ? "test" : "main"];
+      const w = await widget(address, widgetNet);
+      console.log(`[widget] ${widgetNet.name} ${address} → ${w.value.label} ${nim(BigInt(w.value.luna))} NIM`);
+      return json(res, 200, w, { "access-control-allow-origin": "*" });
     }
 
     // Every action, with its hash. A staking app that asks to be trusted and

@@ -1,0 +1,6 @@
+{
+  "v": 1,
+  "name": "Staking",
+  "description": "How much NIM you have staked, what it earned, and when unstaked NIM is ready.",
+  "dataUrl": "/api/widget"
+}

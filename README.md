@@ -71,6 +71,12 @@ We found four rules that aren't in the docs, by testing on mainnet with real mon
 
 Open it in Nimiq Pay (Mini Apps → Custom URL) to stake your own NIM, or in any browser to see the preview.
 
+## On the Nimiq Pay home screen
+
+NimJar can put a small staking card on the Nimiq Pay home screen: how much is staked, what it has earned, and, while getting NIM back out, how long the wait is and when a step needs you. Add it from NimJar's menu in Nimiq Pay's Mini Apps list. Nimiq Pay asks once before it shares your address with NimJar.
+
+Nimiq Pay draws the card itself, from `public/nimiq-pay-widget.json` and the data at `/api/widget?address=…&network=mainnet|testnet`. Nothing runs in the background and NimJar still can't move your NIM. "Earned so far" is kept for an hour per wallet, because working it out reads the wallet's whole history.
+
 ## For developers
 
 ```bash
@@ -84,6 +90,7 @@ A small Node server that only reads the blockchain, and one page. No build step,
 | File | What it does |
 |---|---|
 | `src/server.js` | Reads the blockchain and serves the page. Never signs anything. |
+| `public/nimiq-pay-widget.json` | Tells Nimiq Pay where to get the home screen card's data |
 | `src/chain.js` | Balances, staking history, transaction checks |
 | `public/app.js` | The app: screens, amounts, Nimiq Pay calls |
 | `public/app.css` | The design |
