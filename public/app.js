@@ -145,7 +145,9 @@ const framed = () => !!device && getComputedStyle(device).overflowY !== "visible
 const toTop = (smooth = true) => (framed() ? device : window).scrollTo({ top: 0, behavior: smooth ? "smooth" : "auto" });
 
 const S = {
-  provider: null,           // null outside Nimiq Pay
+  host: null,               // Nimiq Pay, once it's found; null outside it
+  provider: null,           // the host, once the person has tapped Connect
+  connecting: false,
   net: CFG.net,
   address: CFG.demo[CFG.net],
   data: null,
@@ -520,7 +522,9 @@ function render() {
   const showForm = !w.isStaking || S.view === "form";
   const preview = DEMO.on
     ? `<div class="msg demo-note"><b>Demo wallet.</b> Nothing here is real or sent. The real wait is up to a day; here it's 15 seconds. <button class="link" type="button" data-act="demo-exit">Leave the demo</button></div>`
-    : S.provider ? "" :
+    : S.provider ? "" : S.host ?
+    `<div class="msg">Preview: this is a real staked wallet on Nimiq ${S.net === "test" ? "testnet" : "mainnet"}. Connect Nimiq Pay to see and stake your own NIM.
+      <button class="cta try" type="button" data-act="connect" ${S.connecting ? "disabled" : ""}>${S.connecting ? "Waiting for Nimiq Pay…" : "Connect Nimiq Pay"}</button></div>` :
     `<div class="msg">Preview: this is a real staked wallet on Nimiq ${S.net === "test" ? "testnet" : "mainnet"}. Open NimJar inside Nimiq Pay to stake your own NIM.
       <button class="cta quiet try" type="button" data-act="demo">Try every step with a demo wallet</button></div>`;
 
@@ -549,7 +553,7 @@ function render() {
 }
 
 function dockFor(w, showForm) {
-  const hint = `<div class="small">${DEMO.on ? "Demo wallet: no Nimiq Pay needed, nothing is sent" : S.provider ? "Nimiq Pay will ask you to confirm" : "Preview only: open in Nimiq Pay to stake"}</div>`;
+  const hint = `<div class="small">${DEMO.on ? "Demo wallet: no Nimiq Pay needed, nothing is sent" : S.provider ? "Nimiq Pay will ask you to confirm" : S.host ? "Preview only: connect Nimiq Pay to stake" : "Preview only: open in Nimiq Pay to stake"}</div>`;
   const wrap = (x) => `<div>${x}</div>`;
   if (S.busy) return wrap(`<button class="cta" type="button" disabled>Waiting for Nimiq Pay…</button>`);
   if (showForm) return w.maxStake >= MINIMUM ? wrap(`<button class="cta" type="button" id="go" data-act="stake">Stake</button>` + hint) : "";
@@ -630,7 +634,9 @@ function wave(svg) {
 
 /* ---- actions ------------------------------------------------------------- */
 function previewOnly() {
-  S.msg = { kind: "info", text: "This is a preview of a real wallet. Open NimJar inside Nimiq Pay to move your own NIM." };
+  S.msg = { kind: "info", text: S.host
+    ? "This is a preview of a real wallet. Tap Connect Nimiq Pay to move your own NIM."
+    : "This is a preview of a real wallet. Open NimJar inside Nimiq Pay to move your own NIM." };
   render();
   toTop();
 }
@@ -696,6 +702,7 @@ document.addEventListener("click", (e) => {
   if (act === "retry") { S.error = null; render(); refresh(); }
   if (act === "wave") wave(el.querySelector(".albie"));
   if (act === "demo") startDemo();
+  if (act === "connect") connect();
   if (act === "demo-exit") location.reload();
   if (act === "qa") {
     S.qa = Number(el.dataset.i);
@@ -845,18 +852,44 @@ function buddy() {
   });
 }
 
+/**
+ * Ask Nimiq Pay for the person's address, only once they tap Connect. Asking
+ * on page load opens Nimiq Pay's permission sheet while the mini app is still
+ * opening, and on some devices it lands behind the webview where nobody can
+ * tap it.
+ */
+async function connect() {
+  if (!S.host || S.connecting) return;
+  S.connecting = true; S.msg = null; render();
+  try {
+    const accounts = await S.host.listAccounts();
+    if (accounts?.error) throw new Error(accounts.error.message || "the wallet refused");
+    if (!Array.isArray(accounts) || !accounts.length) throw new Error("no address was shared");
+    S.address = accounts[0];
+    S.provider = S.host;
+    S.net = await whichNetwork();
+    S.view = "home"; S.amount = ""; S.history = [];
+  } catch (e) {
+    const m = String(e?.message || e || "");
+    S.msg = { kind: "bad", text: /reject|cancel|denied|abort|closed|dismiss/i.test(m)
+      ? "You cancelled in Nimiq Pay. Nothing was shared."
+      : "Couldn't connect to Nimiq Pay: " + m };
+  } finally {
+    S.connecting = false;
+  }
+  await refresh();
+  toTop();
+}
+
 /* ---- boot ---------------------------------------------------------------- */
 async function boot() {
   render();
   buddy();
   try {
-    S.provider = await init({ timeout: 2500 });
-    const accounts = await S.provider.listAccounts();
-    if (Array.isArray(accounts) && accounts.length) S.address = accounts[0];
-    S.net = await whichNetwork();
+    S.host = await init({ timeout: 2500 });
     document.documentElement.classList.add("in-pay");
   } catch {
-    S.provider = null;   // not inside Nimiq Pay: show the real staked wallet instead
+    S.host = null;   // not inside Nimiq Pay: show the real staked wallet instead
   }
   await refresh();
 }
